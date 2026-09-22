@@ -6,6 +6,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
+const rateLimit = require("express-rate-limit");
 const { Pool } = require("pg");
 const Razorpay = require("razorpay");
 
@@ -13,7 +14,35 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+// ---------------------------------------------------------------
+// Crash-resistance, part 1: limit how many requests one visitor
+// can fire per minute. Stops a flood/bot from overwhelming the server.
+// ---------------------------------------------------------------
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,     // 1 minute window
+  max: 60,                 // max 60 requests per minute per visitor
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests — please slow down and try again shortly." },
+});
+app.use("/api/", apiLimiter);
+
+// ---------------------------------------------------------------
+// Crash-resistance, part 2: cap how many database connections this
+// server can open at once, so a traffic spike can't exhaust your
+// database's connection limit and take everything down with it.
+// ---------------------------------------------------------------
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 15,                       // max simultaneous connections
+  idleTimeoutMillis: 30000,      // close idle connections after 30s
+  connectionTimeoutMillis: 5000, // fail fast instead of hanging forever
+});
+pool.on("error", (err) => {
+  // A dropped idle connection should never crash the whole server.
+  console.error("Unexpected database pool error (handled, server still running):", err.message);
+});
+
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET,
@@ -162,6 +191,33 @@ async function sendWhatsAppPass({ to, code, eventId, qty, amount }) {
 }
 
 app.get("/health", (req, res) => res.json({ ok: true }));
+
+// ---------------------------------------------------------------
+// Crash-resistance, part 3: catch-all error handler. Must be the
+// LAST app.use() — any error thrown anywhere above lands here
+// instead of taking the whole server down.
+// ---------------------------------------------------------------
+app.use((err, req, res, next) => {
+  console.error("Unhandled route error:", err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: "Something went wrong on our end. Please try again." });
+});
+
+// ---------------------------------------------------------------
+// Crash-resistance, part 4: process-level safety nets. These catch
+// errors that happen outside Express's normal request handling
+// (e.g. inside a stray Promise) so they're logged clearly instead
+// of silently killing the process with no explanation.
+// ---------------------------------------------------------------
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled promise rejection (server still running):", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught exception — restarting cleanly:", err);
+  // Exit so Railway's process manager restarts us fresh in a few seconds,
+  // rather than continuing to run in a potentially corrupted state.
+  process.exit(1);
+});
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`MNG backend listening on :${port}`));
