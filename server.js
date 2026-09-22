@@ -25,10 +25,10 @@ const razorpay = new Razorpay({
 // ---------------------------------------------------------------
 app.post("/api/create-order", async (req, res) => {
   try {
-    const { eventId, passId, qty } = req.body;
+    const { eventId, passName, qty } = req.body;
     const passRes = await pool.query(
-      "select price from passes where id=$1 and event_id=$2",
-      [passId, eventId]
+      "select id, price from passes where event_id=$1 and name=$2",
+      [eventId, passName]
     );
     if (!passRes.rows.length) return res.status(400).json({ error: "Invalid pass" });
 
@@ -56,7 +56,7 @@ app.post("/api/verify-payment", async (req, res) => {
   try {
     const {
       razorpay_order_id, razorpay_payment_id, razorpay_signature,
-      eventId, passId, qty, buyerName, buyerEmail, buyerWhatsapp,
+      eventId, passName, qty, buyerName, buyerEmail, buyerWhatsapp,
       squadCode, agentId, channel,
     } = req.body;
 
@@ -69,7 +69,12 @@ app.post("/api/verify-payment", async (req, res) => {
       return res.status(400).json({ error: "Signature mismatch — payment not verified" });
     }
 
-    const passRes = await pool.query("select price from passes where id=$1", [passId]);
+    const passRes = await pool.query(
+      "select id, price from passes where event_id=$1 and name=$2",
+      [eventId, passName]
+    );
+    if (!passRes.rows.length) return res.status(400).json({ error: "Invalid pass" });
+    const passId = passRes.rows[0].id;
     const rate = Number(passRes.rows[0].price);
     const amount = Math.round(rate * Number(qty));
     const code = `MNG-${eventId.toUpperCase()}-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
@@ -92,7 +97,7 @@ app.post("/api/verify-payment", async (req, res) => {
     // Fire-and-forget WhatsApp send — don't block the response on it.
     sendWhatsAppPass({ to: buyerWhatsapp, code, eventId, qty, amount }).catch(console.error);
 
-    res.json({ ok: true, code });
+    res.json({ ok: true, code, amount });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Verification failed" });
