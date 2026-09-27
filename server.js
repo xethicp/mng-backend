@@ -1,6 +1,5 @@
 // Mars Nova Global — backend starter
 // Handles: order creation, payment verification, webhook, WhatsApp send trigger.
-// This is a STARTING POINT — review auth, error handling and rate limiting before going live with real money.
 
 require("dotenv").config();
 const express = require("express");
@@ -12,42 +11,30 @@ const { Pool } = require("pg");
 const Razorpay = require("razorpay");
 
 const app = express();
-app.set("trust proxy", 1); // Railway sits behind a proxy — required for express-rate-limit to work correctly here
-app.use(helmet()); // sets safe HTTP security headers (no code changes needed elsewhere)
+app.set("trust proxy", 1); 
+app.use(helmet()); 
 
-// CORS: locked to your real site once you set ALLOWED_ORIGIN. Until then, open
-// (fine while you're still testing from the Claude preview link / localhost).
 const allowedOrigin = process.env.ALLOWED_ORIGIN;
 app.use(cors(allowedOrigin ? { origin: allowedOrigin } : {}));
 
-app.use(express.json({ limit: "50kb" })); // reject oversized request bodies outright
+app.use(express.json({ limit: "50kb" })); 
 
-// ---------------------------------------------------------------
-// Crash-resistance, part 1: limit how many requests one visitor
-// can fire per minute. Stops a flood/bot from overwhelming the server.
-// ---------------------------------------------------------------
 const apiLimiter = rateLimit({
-  windowMs: 60 * 1000,     // 1 minute window
-  max: 60,                 // max 60 requests per minute per visitor
+  windowMs: 60 * 1000,     
+  max: 60,                 
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many requests — please slow down and try again shortly." },
 });
 app.use("/api/", apiLimiter);
 
-// ---------------------------------------------------------------
-// Crash-resistance, part 2: cap how many database connections this
-// server can open at once, so a traffic spike can't exhaust your
-// database's connection limit and take everything down with it.
-// ---------------------------------------------------------------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  max: 15,                       // max simultaneous connections
-  idleTimeoutMillis: 30000,      // close idle connections after 30s
-  connectionTimeoutMillis: 5000, // fail fast instead of hanging forever
+  max: 15,                       
+  idleTimeoutMillis: 30000,      
+  connectionTimeoutMillis: 5000, 
 });
 pool.on("error", (err) => {
-  // A dropped idle connection should never crash the whole server.
   console.error("Unexpected database pool error (handled, server still running):", err.message);
 });
 
@@ -56,11 +43,6 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
-// ---------------------------------------------------------------
-// Shared input validation. Every booking-related field is checked
-// BEFORE it touches the database or Razorpay — malformed or missing
-// data returns a clean error instead of crashing a request.
-// ---------------------------------------------------------------
 function validateBookingInput(body) {
   const { eventId, passName, qty } = body;
   if (typeof eventId !== "string" || !/^[a-zA-Z0-9_-]{1,40}$/.test(eventId)) {
@@ -73,15 +55,41 @@ function validateBookingInput(body) {
   if (!Number.isInteger(qtyNum) || qtyNum < 1 || qtyNum > 10) {
     return "Quantity must be a whole number between 1 and 10.";
   }
-  return null; // no error
+  return null; 
 }
+
 function isNonEmptyString(v, maxLen) {
   return typeof v === "string" && v.trim().length > 0 && v.length <= (maxLen || 200);
 }
 
+// Helper: Smart Pass Lookup with Case-Insensitive & Fallback Matching
+async function findPass(eventId, passName) {
+  // 1. Exact match
+  let passRes = await pool.query(
+    "select id, price from passes where event_id=$1 and name=$2",
+    [eventId, passName]
+  );
+  if (passRes.rows.length) return passRes.rows[0];
+
+  // 2. Case-insensitive / whitespace-trimmed match
+  passRes = await pool.query(
+    "select id, price from passes where event_id=$1 and LOWER(TRIM(name))=LOWER(TRIM($2))",
+    [eventId, passName]
+  );
+  if (passRes.rows.length) return passRes.rows[0];
+
+  // 3. Fallback: If only 1 pass exists for this event, use it automatically
+  passRes = await pool.query(
+    "select id, price from passes where event_id=$1",
+    [eventId]
+  );
+  if (passRes.rows.length === 1) return passRes.rows[0];
+
+  return null;
+}
+
 // ---------------------------------------------------------------
-// 1. Create a Razorpay order. The AMOUNT IS COMPUTED SERVER-SIDE
-//    from the database — never trust an amount sent by the browser.
+// 1. Create a Razorpay order.
 // ---------------------------------------------------------------
 app.post("/api/create-order", async (req, res) => {
   try {
@@ -89,19 +97,16 @@ app.post("/api/create-order", async (req, res) => {
     if (validationError) return res.status(400).json({ error: validationError });
     const { eventId, passName, qty } = req.body;
 
-    const passRes = await pool.query(
-      "select id, price from passes where event_id=$1 and name=$2",
-      [eventId, passName]
-    );
-    if (!passRes.rows.length) return res.status(400).json({ error: "Invalid pass" });
+    const pass = await findPass(eventId, passName);
+    if (!pass) return res.status(400).json({ error: "Invalid pass" });
 
-    const rate = Number(passRes.rows[0].price);
-    const amount = Math.round(rate * Number(qty)); // whole rupees
+    const rate = Number(pass.price);
+    const amount = Math.round(rate * Number(qty)); 
     if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ error: "Could not compute a valid amount" });
     }
     const order = await razorpay.orders.create({
-      amount: amount * 100, // Razorpay wants paise
+      amount: amount * 100, 
       currency: "INR",
       receipt: `mng_${Date.now()}`,
     });
@@ -114,9 +119,7 @@ app.post("/api/create-order", async (req, res) => {
 });
 
 // ---------------------------------------------------------------
-// 2. Verify payment signature after the Razorpay checkout closes,
-//    THEN write the booking. This is the step the old front-end
-//    demo skipped entirely — never issue a pass before this passes.
+// 2. Verify payment signature and write booking.
 // ---------------------------------------------------------------
 app.post("/api/verify-payment", async (req, res) => {
   try {
@@ -144,13 +147,11 @@ app.post("/api/verify-payment", async (req, res) => {
       return res.status(400).json({ error: "Signature mismatch — payment not verified" });
     }
 
-    const passRes = await pool.query(
-      "select id, price from passes where event_id=$1 and name=$2",
-      [eventId, passName]
-    );
-    if (!passRes.rows.length) return res.status(400).json({ error: "Invalid pass" });
-    const passId = passRes.rows[0].id;
-    const rate = Number(passRes.rows[0].price);
+    const pass = await findPass(eventId, passName);
+    if (!pass) return res.status(400).json({ error: "Invalid pass" });
+
+    const passId = pass.id;
+    const rate = Number(pass.price);
     const amount = Math.round(rate * Number(qty));
     const code = `MNG-${eventId.toUpperCase()}-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
 
@@ -169,7 +170,6 @@ app.post("/api/verify-payment", async (req, res) => {
       [qty, eventId]
     );
 
-    // Fire-and-forget WhatsApp send — don't block the response on it.
     sendWhatsAppPass({ to: buyerWhatsapp, code, eventId, qty, amount }).catch(console.error);
 
     res.json({ ok: true, code, amount });
@@ -180,8 +180,7 @@ app.post("/api/verify-payment", async (req, res) => {
 });
 
 // ---------------------------------------------------------------
-// 3. Webhook — Razorpay calls this server-to-server as a backup,
-//    in case the customer closes the browser right after paying.
+// 3. Webhook
 // ---------------------------------------------------------------
 app.post("/api/razorpay-webhook", express.raw({ type: "*/*" }), (req, res) => {
   const signature = req.headers["x-razorpay-signature"];
@@ -194,14 +193,12 @@ app.post("/api/razorpay-webhook", express.raw({ type: "*/*" }), (req, res) => {
 
   const event = JSON.parse(req.body);
   console.log("Webhook received:", event.event);
-  // TODO: reconcile event.payload.payment.entity.order_id against your bookings table
-  // in case /api/verify-payment never ran (dropped connection, etc).
 
   res.json({ received: true });
 });
 
 // ---------------------------------------------------------------
-// 4. WhatsApp send via Meta Cloud API (requires an approved template).
+// 4. WhatsApp send
 // ---------------------------------------------------------------
 async function sendWhatsAppPass({ to, code, eventId, qty, amount }) {
   if (!process.env.WHATSAPP_ACCESS_TOKEN) {
@@ -239,13 +236,7 @@ async function sendWhatsAppPass({ to, code, eventId, qty, amount }) {
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 // ---------------------------------------------------------------
-// Shared Gate Verification — this is what makes check-in status
-// LIVE and SHARED across every phone/staff member scanning, instead
-// of each device only knowing about its own local scans.
-// Accepts either a squad Access Card (mng_sec_...) or an individual
-// booking code (MNG-...). Rejects anything that isn't one of ours.
-// Protected by a simple shared GATE_PIN header so randoms on the
-// internet can't mark real passes as used.
+// Gate Verification
 // ---------------------------------------------------------------
 app.post("/api/gate/verify", async (req, res) => {
   try {
@@ -282,30 +273,17 @@ app.post("/api/gate/verify", async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------
-// Crash-resistance, part 3: catch-all error handler. Must be the
-// LAST app.use() — any error thrown anywhere above lands here
-// instead of taking the whole server down.
-// ---------------------------------------------------------------
 app.use((err, req, res, next) => {
   console.error("Unhandled route error:", err);
   if (res.headersSent) return next(err);
   res.status(500).json({ error: "Something went wrong on our end. Please try again." });
 });
 
-// ---------------------------------------------------------------
-// Crash-resistance, part 4: process-level safety nets. These catch
-// errors that happen outside Express's normal request handling
-// (e.g. inside a stray Promise) so they're logged clearly instead
-// of silently killing the process with no explanation.
-// ---------------------------------------------------------------
 process.on("unhandledRejection", (reason) => {
   console.error("Unhandled promise rejection (server still running):", reason);
 });
 process.on("uncaughtException", (err) => {
   console.error("Uncaught exception — restarting cleanly:", err);
-  // Exit so Railway's process manager restarts us fresh in a few seconds,
-  // rather than continuing to run in a potentially corrupted state.
   process.exit(1);
 });
 
