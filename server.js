@@ -5,14 +5,22 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const helmet = require("helmet");
 const crypto = require("crypto");
 const rateLimit = require("express-rate-limit");
 const { Pool } = require("pg");
 const Razorpay = require("razorpay");
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+app.set("trust proxy", 1); // Railway sits behind a proxy — required for express-rate-limit to work correctly here
+app.use(helmet()); // sets safe HTTP security headers (no code changes needed elsewhere)
+
+// CORS: locked to your real site once you set ALLOWED_ORIGIN. Until then, open
+// (fine while you're still testing from the Claude preview link / localhost).
+const allowedOrigin = process.env.ALLOWED_ORIGIN;
+app.use(cors(allowedOrigin ? { origin: allowedOrigin } : {}));
+
+app.use(express.json({ limit: "50kb" })); // reject oversized request bodies outright
 
 // ---------------------------------------------------------------
 // Crash-resistance, part 1: limit how many requests one visitor
@@ -49,12 +57,38 @@ const razorpay = new Razorpay({
 });
 
 // ---------------------------------------------------------------
+// Shared input validation. Every booking-related field is checked
+// BEFORE it touches the database or Razorpay — malformed or missing
+// data returns a clean error instead of crashing a request.
+// ---------------------------------------------------------------
+function validateBookingInput(body) {
+  const { eventId, passName, qty } = body;
+  if (typeof eventId !== "string" || !/^[a-zA-Z0-9_-]{1,40}$/.test(eventId)) {
+    return "Invalid or missing event.";
+  }
+  if (typeof passName !== "string" || passName.length < 1 || passName.length > 60) {
+    return "Invalid or missing pass type.";
+  }
+  const qtyNum = Number(qty);
+  if (!Number.isInteger(qtyNum) || qtyNum < 1 || qtyNum > 10) {
+    return "Quantity must be a whole number between 1 and 10.";
+  }
+  return null; // no error
+}
+function isNonEmptyString(v, maxLen) {
+  return typeof v === "string" && v.trim().length > 0 && v.length <= (maxLen || 200);
+}
+
+// ---------------------------------------------------------------
 // 1. Create a Razorpay order. The AMOUNT IS COMPUTED SERVER-SIDE
 //    from the database — never trust an amount sent by the browser.
 // ---------------------------------------------------------------
 app.post("/api/create-order", async (req, res) => {
   try {
+    const validationError = validateBookingInput(req.body);
+    if (validationError) return res.status(400).json({ error: validationError });
     const { eventId, passName, qty } = req.body;
+
     const passRes = await pool.query(
       "select id, price from passes where event_id=$1 and name=$2",
       [eventId, passName]
@@ -63,6 +97,9 @@ app.post("/api/create-order", async (req, res) => {
 
     const rate = Number(passRes.rows[0].price);
     const amount = Math.round(rate * Number(qty)); // whole rupees
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: "Could not compute a valid amount" });
+    }
     const order = await razorpay.orders.create({
       amount: amount * 100, // Razorpay wants paise
       currency: "INR",
@@ -89,6 +126,15 @@ app.post("/api/verify-payment", async (req, res) => {
       squadCode, agentId, channel,
     } = req.body;
 
+    const validationError = validateBookingInput(req.body);
+    if (validationError) return res.status(400).json({ error: validationError });
+    if (!isNonEmptyString(razorpay_order_id) || !isNonEmptyString(razorpay_payment_id) || !isNonEmptyString(razorpay_signature)) {
+      return res.status(400).json({ error: "Missing payment verification details." });
+    }
+    if (!isNonEmptyString(buyerName, 120)) return res.status(400).json({ error: "Buyer name is required." });
+    if (!isNonEmptyString(buyerEmail, 160) || !buyerEmail.includes("@")) return res.status(400).json({ error: "A valid buyer email is required." });
+    if (!isNonEmptyString(buyerWhatsapp, 15) || !/^\d{10,15}$/.test(buyerWhatsapp)) return res.status(400).json({ error: "A valid WhatsApp number is required." });
+
     const expected = crypto
       .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
       .update(`${razorpay_order_id}|${razorpay_payment_id}`)
@@ -114,7 +160,7 @@ app.post("/api/verify-payment", async (req, res) => {
         channel,agent_id,squad_code,status,razorpay_order_id,razorpay_payment_id)
        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'paid',$13,$14)`,
       [code, eventId, passId, qty, rate, amount, buyerName, buyerEmail, buyerWhatsapp,
-       channel || "Website", agentId || null, squadCode || null,
+       (channel === "Agent" ? "Agent" : "Website"), (isNonEmptyString(agentId, 60) ? agentId : null), (isNonEmptyString(squadCode, 60) ? squadCode : null),
        razorpay_order_id, razorpay_payment_id]
     );
 
@@ -191,6 +237,50 @@ async function sendWhatsAppPass({ to, code, eventId, qty, amount }) {
 }
 
 app.get("/health", (req, res) => res.json({ ok: true }));
+
+// ---------------------------------------------------------------
+// Shared Gate Verification — this is what makes check-in status
+// LIVE and SHARED across every phone/staff member scanning, instead
+// of each device only knowing about its own local scans.
+// Accepts either a squad Access Card (mng_sec_...) or an individual
+// booking code (MNG-...). Rejects anything that isn't one of ours.
+// Protected by a simple shared GATE_PIN header so randoms on the
+// internet can't mark real passes as used.
+// ---------------------------------------------------------------
+app.post("/api/gate/verify", async (req, res) => {
+  try {
+    const pin = req.headers["x-gate-pin"];
+    if (process.env.GATE_PIN && pin !== process.env.GATE_PIN) {
+      return res.status(401).json({ status: "unauthorized", message: "Wrong gate PIN." });
+    }
+    const code = String(req.body.code || "").trim();
+    if (!code) return res.status(400).json({ status: "not_found", message: "No code provided." });
+
+    if (/^mng_sec_/i.test(code)) {
+      const sq = await pool.query("select * from squads where access_id=$1", [code]);
+      if (!sq.rows.length) return res.json({ status: "not_found", message: "No squad Access Card matches this code." });
+      const squad = sq.rows[0];
+      if (squad.revoked) return res.json({ status: "revoked", name: squad.name, message: "This Access Card has been revoked." });
+      if (squad.checked_in) return res.json({ status: "duplicate", name: squad.name, checkedInAt: squad.checked_in_at, message: "Already checked in." });
+      await pool.query("update squads set checked_in=true, checked_in_at=now() where access_id=$1", [code]);
+      return res.json({ status: "granted", name: squad.name, type: "Squad Access Card" });
+    }
+
+    if (/^MNG-/i.test(code)) {
+      const b = await pool.query("select * from bookings where code=$1", [code]);
+      if (!b.rows.length) return res.json({ status: "not_found", message: "No pass matches this code." });
+      const booking = b.rows[0];
+      if (booking.checked_in) return res.json({ status: "duplicate", name: booking.buyer_name, checkedInAt: booking.checked_in_at, message: "Already checked in." });
+      await pool.query("update bookings set checked_in=true, checked_in_at=now() where code=$1", [code]);
+      return res.json({ status: "granted", name: booking.buyer_name, type: booking.pass_id ? "Individual pass" : "Pass", event: booking.event_id, qty: booking.qty });
+    }
+
+    return res.json({ status: "not_found", message: "This isn't an MNG pass code." });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ status: "error", message: "Could not verify — try again." });
+  }
+});
 
 // ---------------------------------------------------------------
 // Crash-resistance, part 3: catch-all error handler. Must be the
